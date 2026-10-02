@@ -1,0 +1,157 @@
+<!doctype html><meta charset="utf-8"><title>Desktop Body Brain</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{font:15px system-ui;background:#0e0e10;color:#eee;margin:0;padding:12px}
+input,button{padding:8px;margin:2px;border-radius:6px;border:1px solid #444;background:#1c1c20;color:#eee}
+video{width:320px;border-radius:8px;transform:scaleX(-1);display:block;margin:8px 0}
+#log{height:220px;overflow:auto;background:#1a1a1d;padding:8px;border-radius:8px}
+</style>
+<h3>Desktop Body — Brain</h3>
+ESP32 IP <input id="ip" size="14" placeholder="192.168.x.x">
+Ollama <input id="ol" value="http://localhost:11434" size="22">
+Model <input id="md" value="llama3.2:3b" size="12">
+<button id="go">Start</button>
+<video id="v" autoplay muted playsinline></video>
+<div>Seen: <b id="who">-</b>
+<button id="learn">Learn face</button>
+<button id="mic">🎤 Listen: off</button>
+<label><input type="checkbox" id="trk" checked> Auto-track</label></div>
+<div>
+<button data-c="x:1">Happy</button><button data-c="x:2">Sad</button><button data-c="x:3">Angry</button>
+<button data-c="x:4">Sleepy</button><button data-c="x:5">Wow</button><button data-c="x:6">Love</button>
+<button data-c="x:0">Neutral</button>
+<button data-c="r:-45">⟲ 45</button><button data-c="r:45">45 ⟳</button><button data-c="p:0">Front</button><button data-c="r:360">Spin</button>
+<button data-c="m:0">♪1</button><button data-c="m:1">♪2</button><button data-c="m:2">♪3</button><button data-c="m:-1">■</button>
+</div>
+<div id="log"></div>
+<input id="txt" style="width:60%" placeholder="type to talk"><button id="snd">Send</button>
+
+<script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.js"></script>
+<script>
+const $ = id => document.getElementById(id), V = $('v');
+const EX = {neutral:0, happy:1, sad:2, angry:3, sleepy:4, surprised:5, love:6, think:7};
+const GAIN = 35;   // deg per full-frame offset
+const SIGN = 1;    // set to -1 if the head turns away from your face
+let ws, mem = {facts: [], chat: []}, faces = [], cur = undefined, speaking = false,
+    listening = false, rec, lastSend = 0, lastRec = 0, lastDesc = null, awaitName = false;
+$('ip').value = localStorage.ip || '';
+
+const log = m => { $('log').innerHTML += m + '<br>'; $('log').scrollTop = 1e9; };
+const base = () => 'http://' + $('ip').value;
+const send = s => ws && ws.readyState == 1 && ws.send(s);
+const load = async k => { try { return JSON.parse(await (await fetch(base() + '/store?k=' + k)).text()); } catch (e) { return null; } };
+const save = (k, o) => fetch(base() + '/store?k=' + k, {method: 'POST', body: JSON.stringify(o)});
+const OPT = () => new faceapi.TinyFaceDetectorOptions({inputSize: 224, scoreThreshold: .5});
+
+document.querySelectorAll('[data-c]').forEach(b => b.onclick = () => send(b.dataset.c));
+
+$('go').onclick = async () => {
+  localStorage.ip = $('ip').value;
+  ws = new WebSocket('ws://' + $('ip').value + ':81');
+  ws.onopen = () => { log('ESP32 linked'); send('x:1'); };
+  ws.onclose = () => log('ESP32 link lost');
+  mem = Object.assign(mem, await load('mem') || {});
+  faces = await load('faces') || [];
+  const M = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/';
+  await Promise.all([faceapi.nets.tinyFaceDetector.loadFromUri(M),
+    faceapi.nets.faceLandmark68Net.loadFromUri(M), faceapi.nets.faceRecognitionNet.loadFromUri(M)]);
+  V.srcObject = await navigator.mediaDevices.getUserMedia({video: true});
+  V.onloadeddata = loop;
+  log('ready — ' + faces.length + ' faces, ' + mem.facts.length + ' memories');
+};
+
+async function loop() {
+  const d = await faceapi.detectSingleFace(V, OPT());
+  if (d) {
+    const b = d.box, err = (b.x + b.width / 2) / V.videoWidth - .5;
+    if ($('trk').checked && Math.abs(err) > .07 && Date.now() - lastSend > 300) {
+      send('n:' + (err * GAIN * SIGN).toFixed(1)); lastSend = Date.now();
+    }
+    if (Date.now() - lastRec > 3000) { lastRec = Date.now(); await recognize(); }
+  } else if (cur !== undefined && Date.now() - lastRec > 8000) {
+    cur = undefined; $('who').textContent = '-';
+  }
+  requestAnimationFrame(loop);
+}
+
+async function recognize() {
+  const f = await faceapi.detectSingleFace(V, OPT()).withFaceLandmarks().withFaceDescriptor();
+  if (!f) return;
+  lastDesc = f.descriptor;
+  let best = null, bd = .5;
+  for (const p of faces) { const x = faceapi.euclideanDistance(p.d, f.descriptor); if (x < bd) { bd = x; best = p.n; } }
+  if (best !== cur) {
+    cur = best; $('who').textContent = best || 'unknown';
+    if (best) say('Hi ' + best + '!', 'happy');
+    else { awaitName = true; say("I don't know you yet. What's your name?", 'think'); }
+  }
+}
+
+function learn(name) {
+  if (!lastDesc) return log('no face captured yet');
+  faces.push({n: name, d: Array.from(lastDesc).map(x => +x.toFixed(3))});
+  save('faces', faces); cur = name; $('who').textContent = name;
+}
+$('learn').onclick = () => { const n = prompt('Name?'); if (n) { learn(n); say('Nice to meet you, ' + n, 'happy'); } };
+
+function say(t, e = 'neutral') {
+  send('x:' + (EX[e] ?? 0)); log('🤖 ' + t);
+  const u = new SpeechSynthesisUtterance(t);
+  speaking = true; send('t:1');
+  u.onend = () => { speaking = false; send('t:0'); setTimeout(() => send('x:0'), 3000); };
+  speechSynthesis.speak(u);
+}
+
+async function route(t) {
+  log('🧑 ' + t);
+  const s = t.toLowerCase();
+  if (awaitName) {
+    awaitName = false;
+    const n = t.replace(/my name is|i am|i'm|this is|it's/ig, '').trim().split(' ')[0];
+    learn(n); return say('Nice to meet you, ' + n + '!', 'love');
+  }
+  if (/stop (the )?(music|song)/.test(s)) { send('m:-1'); return say('Stopped.', 'neutral'); }
+  if (/play.*(music|song)/.test(s)) { send('m:' + Math.floor(Math.random() * 3)); return; }
+  if (/(turn|rotate|look) left/.test(s)) return send('r:-45');
+  if (/(turn|rotate|look) right/.test(s)) return send('r:45');
+  if (/spin|360/.test(s)) return send('r:360');
+  if (/face front|look front/.test(s)) return send('p:0');
+  ask(t);
+}
+
+async function ask(text) {
+  const sys = `You are Desktop Body, a small friendly desk robot with an OLED face. Reply in 1-2 short sentences. ` +
+    `Start the reply with one tag: [neutral], [happy], [sad], [angry], [sleepy], [surprised], [love] or [think]. ` +
+    `If something is worth remembering about the user, add a final line "REMEMBER: <fact>". ` +
+    `Person in front of you: ${cur || 'unknown'}.\nKnown facts:\n- ${mem.facts.join('\n- ')}`;
+  mem.chat.push({role: 'user', content: (cur ? cur + ': ' : '') + text});
+  mem.chat = mem.chat.slice(-12);
+  send('x:7');
+  try {
+    const r = await fetch($('ol').value + '/api/chat', {method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({model: $('md').value, stream: false, messages: [{role: 'system', content: sys}, ...mem.chat]})});
+    let a = (await r.json()).message.content;
+    a = a.replace(/REMEMBER:(.*)/g, (_, f) => { mem.facts.push(f.trim()); return ''; }).trim();
+    mem.facts = mem.facts.slice(-50);
+    const m = a.match(/^\s*\[(\w+)\]/); const tag = m ? m[1].toLowerCase() : 'neutral';
+    a = a.replace(/^\s*\[\w+\]\s*/, '');
+    mem.chat.push({role: 'assistant', content: a});
+    save('mem', mem);
+    say(a, tag);
+  } catch (e) { log('Ollama error: ' + e + ' (set OLLAMA_ORIGINS=*)'); send('x:2'); }
+}
+
+$('snd').onclick = () => { const t = $('txt').value.trim(); if (t) { $('txt').value = ''; route(t); } };
+$('txt').onkeydown = e => { if (e.key == 'Enter') $('snd').click(); };
+
+$('mic').onclick = () => {
+  const R = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!R) return alert('Use Chrome');
+  listening = !listening; $('mic').textContent = '🎤 Listen: ' + (listening ? 'on' : 'off');
+  if (!listening) { rec && rec.stop(); return; }
+  rec = new R(); rec.continuous = true; rec.lang = 'en-US';
+  rec.onresult = e => { const x = e.results[e.results.length - 1]; if (x.isFinal && !speaking) route(x[0].transcript.trim()); };
+  rec.onend = () => listening && rec.start();
+  rec.start();
+};
+</script>
