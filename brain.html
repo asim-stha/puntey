@@ -1,20 +1,38 @@
-<!doctype html><meta charset="utf-8"><title>Desktop Body Brain</title>
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Desktop Body Brain</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
 body{font:15px system-ui;background:#0e0e10;color:#eee;margin:0;padding:12px}
-input,button{padding:8px;margin:2px;border-radius:6px;border:1px solid #444;background:#1c1c20;color:#eee}
+input,button,select{padding:8px;margin:2px;border-radius:6px;border:1px solid #444;background:#1c1c20;color:#eee}
 video{width:320px;border-radius:8px;transform:scaleX(-1);display:block;margin:8px 0}
 #log{height:220px;overflow:auto;background:#1a1a1d;padding:8px;border-radius:8px}
 </style>
+</head>
+<body>
 <h3>Desktop Body — Brain</h3>
 ESP32 IP <input id="ip" size="14" placeholder="192.168.x.x">
 Ollama <input id="ol" value="http://localhost:11434" size="22">
 Model <input id="md" value="llama3.2:3b" size="12">
+<br>
+Wake name <input id="wake" value="buddy" size="16" title="separate several names with commas">
+Voice mode
+<select id="mode">
+  <option value="wake">Wake name (say the name first)</option>
+  <option value="push">Push-to-talk (hold button or Space)</option>
+  <option value="always">Always listen (no name needed)</option>
+</select>
+Greet again after <input id="away" type="number" min="1" value="2" style="width:60px"> min away
 <button id="go">Start</button>
 <video id="v" autoplay muted playsinline></video>
 <div>Seen: <b id="who">-</b>
 <button id="learn">Learn face</button>
+<select id="flist"></select>
+<button id="del">🗑️ Delete selected face</button>
 <button id="mic">🎤 Listen: off</button>
+<button id="ptt">🎙 Hold to talk (or Space)</button>
 <label><input type="checkbox" id="trk" checked> Auto-track</label></div>
 <div>
 <button data-c="x:1">Happy</button><button data-c="x:2">Sad</button><button data-c="x:3">Angry</button>
@@ -24,7 +42,7 @@ Model <input id="md" value="llama3.2:3b" size="12">
 <button data-c="m:0">♪1</button><button data-c="m:1">♪2</button><button data-c="m:2">♪3</button><button data-c="m:-1">■</button>
 </div>
 <div id="log"></div>
-<input id="txt" style="width:60%" placeholder="type to talk"><button id="snd">Send</button>
+<input id="txt" style="width:60%" placeholder="type to talk (no wake name needed)"><button id="snd">Send</button>
 
 <script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.js"></script>
 <script>
@@ -32,9 +50,20 @@ const $ = id => document.getElementById(id), V = $('v');
 const EX = {neutral:0, happy:1, sad:2, angry:3, sleepy:4, surprised:5, love:6, think:7};
 const GAIN = 35;   // deg per full-frame offset
 const SIGN = 1;    // set to -1 if the head turns away from your face
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+const AWAY = () => (+$('away').value || 2) * 60000;   // greet the same person again after this long away
+const mode = () => $('mode').value;
+
 let ws, mem = {facts: [], chat: []}, faces = [], cur = undefined, speaking = false,
-    listening = false, rec, lastSend = 0, lastRec = 0, lastDesc = null, awaitName = false;
+    listening = false, rec = null, pttRec = null, lastSend = 0, lastRec = 0,
+    lastSeen = 0, greetOK = false, lastGreeted, awakeUntil = 0, sayId = 0;
+
 $('ip').value = localStorage.ip || '';
+$('wake').value = localStorage.wake || 'buddy';
+$('mode').value = localStorage.mode || 'wake';
+$('away').value = localStorage.away || 2;
+$('wake').onchange = () => localStorage.wake = $('wake').value;
+$('away').onchange = () => localStorage.away = $('away').value;
 
 const log = m => { $('log').innerHTML += m + '<br>'; $('log').scrollTop = 1e9; };
 const base = () => 'http://' + $('ip').value;
@@ -45,24 +74,35 @@ const OPT = () => new faceapi.TinyFaceDetectorOptions({inputSize: 224, scoreThre
 
 document.querySelectorAll('[data-c]').forEach(b => b.onclick = () => send(b.dataset.c));
 
+// ---------- start ----------
 $('go').onclick = async () => {
-  localStorage.ip = $('ip').value;
-  ws = new WebSocket('ws://' + $('ip').value + ':81');
-  ws.onopen = () => { log('ESP32 linked'); send('x:1'); };
-  ws.onclose = () => log('ESP32 link lost');
-  mem = Object.assign(mem, await load('mem') || {});
-  faces = await load('faces') || [];
-  const M = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/';
-  await Promise.all([faceapi.nets.tinyFaceDetector.loadFromUri(M),
-    faceapi.nets.faceLandmark68Net.loadFromUri(M), faceapi.nets.faceRecognitionNet.loadFromUri(M)]);
-  V.srcObject = await navigator.mediaDevices.getUserMedia({video: true});
-  V.onloadeddata = loop;
-  log('ready — ' + faces.length + ' faces, ' + mem.facts.length + ' memories');
+  try {
+    localStorage.ip = $('ip').value;
+    ws = new WebSocket('ws://' + $('ip').value + ':81');
+    ws.onopen = () => { log('ESP32 linked'); send('x:1'); };
+    ws.onclose = () => log('ESP32 link lost');
+    mem = Object.assign(mem, await load('mem') || {});
+    mem.facts = mem.facts || []; mem.chat = mem.chat || [];
+    faces = await load('faces') || [];
+    refreshList();
+    const M = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model/';
+    await Promise.all([
+      faceapi.nets.tinyFaceDetector.loadFromUri(M),
+      faceapi.nets.faceLandmark68Net.loadFromUri(M),
+      faceapi.nets.faceRecognitionNet.loadFromUri(M)
+    ]);
+    V.srcObject = await navigator.mediaDevices.getUserMedia({video: true});
+    V.onloadeddata = loop;
+    log('ready — ' + faces.length + ' faces, ' + mem.facts.length + ' memories');
+  } catch (e) { log('❌ start failed: ' + e.message); }
 };
 
+// ---------- camera loop ----------
 async function loop() {
   const d = await faceapi.detectSingleFace(V, OPT());
   if (d) {
+    if (Date.now() - lastSeen > AWAY()) greetOK = true;
+    lastSeen = Date.now();
     const b = d.box, err = (b.x + b.width / 2) / V.videoWidth - .5;
     if ($('trk').checked && Math.abs(err) > .07 && Date.now() - lastSend > 300) {
       send('n:' + (err * GAIN * SIGN).toFixed(1)); lastSend = Date.now();
@@ -77,39 +117,87 @@ async function loop() {
 async function recognize() {
   const f = await faceapi.detectSingleFace(V, OPT()).withFaceLandmarks().withFaceDescriptor();
   if (!f) return;
-  lastDesc = f.descriptor;
   let best = null, bd = .5;
   for (const p of faces) { const x = faceapi.euclideanDistance(p.d, f.descriptor); if (x < bd) { bd = x; best = p.n; } }
   if (best !== cur) {
     cur = best; $('who').textContent = best || 'unknown';
-    if (best) say('Hi ' + best + '!', 'happy');
-    else { awaitName = true; say("I don't know you yet. What's your name?", 'think'); }
+    if (best && (greetOK || best !== lastGreeted)) {
+      greetOK = false; lastGreeted = best;
+      say('Hi ' + best + '!', 'happy');
+    }
   }
 }
 
-function learn(name) {
-  if (!lastDesc) return log('no face captured yet');
-  faces.push({n: name, d: Array.from(lastDesc).map(x => +x.toFixed(3))});
-  save('faces', faces); cur = name; $('who').textContent = name;
+// ---------- saved faces: learn only on button, delete by name ----------
+function refreshList() {
+  const names = [...new Set(faces.map(p => p.n))];
+  $('flist').replaceChildren(...(names.length ? names.map(n => new Option(n, n)) : [new Option('(no saved faces)', '')]));
 }
-$('learn').onclick = () => { const n = prompt('Name?'); if (n) { learn(n); say('Nice to meet you, ' + n, 'happy'); } };
 
+async function setFaces(list) {
+  try {
+    const r = await save('faces', list);          // saved on the ESP32 = permanent
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    faces = list; refreshList(); return true;
+  } catch (e) { log('❌ could not save to the ESP32: ' + e.message); return false; }
+}
+
+$('learn').onclick = async () => {
+  if (!faceapi.nets.faceRecognitionNet.isLoaded) return alert('Press Start first.');
+  const f = await faceapi.detectSingleFace(V, OPT()).withFaceLandmarks().withFaceDescriptor();
+  if (!f) return alert('No face visible. Look at the camera and try again.');
+  const n = (prompt('Name for this face?') || '').trim();
+  if (!n) return;
+  const ok = await setFaces([...faces, {n, d: Array.from(f.descriptor).map(x => +x.toFixed(3))}]);
+  if (ok) { cur = n; lastGreeted = n; $('who').textContent = n; say('Nice to meet you, ' + n, 'happy'); }
+};
+
+$('del').onclick = async () => {
+  const n = $('flist').value;
+  if (!n) return log('No face selected.');
+  if (!confirm('Permanently delete the face of "' + n + '"?')) return;
+  if (await setFaces(faces.filter(p => p.n !== n))) {
+    if (cur === n) { cur = undefined; lastGreeted = undefined; $('who').textContent = '-'; }
+    log('🗑️ deleted face: ' + n);
+  }
+};
+
+// ---------- speaking (cannot get stuck) ----------
 function say(t, e = 'neutral') {
+  const id = ++sayId;
   send('x:' + (EX[e] ?? 0)); log('🤖 ' + t);
+  speechSynthesis.cancel();
   const u = new SpeechSynthesisUtterance(t);
   speaking = true; send('t:1');
-  u.onend = () => { speaking = false; send('t:0'); setTimeout(() => send('x:0'), 3000); };
+  const done = () => {
+    if (id !== sayId) return;
+    speaking = false; send('t:0');
+    setTimeout(() => send('x:0'), 3000);
+  };
+  u.onend = done; u.onerror = done;
+  setTimeout(done, 3000 + t.length * 90);   // safety timer
   speechSynthesis.speak(u);
+}
+
+// ---------- understanding what you say ----------
+const WAKE = () => ($('wake').value || 'buddy').toLowerCase().split(',').map(s => s.trim()).filter(Boolean);
+
+function heard(text) {               // wake-name mode
+  const s = text.toLowerCase();
+  const w = WAKE().find(n => s.includes(n));
+  if (w) {
+    const rest = text.slice(s.indexOf(w) + w.length).replace(/^[\s,.!?]+/, '');
+    if (rest) return route(rest);                 // "Buddy, tell me a joke"
+    awakeUntil = Date.now() + 10000;              // just "Buddy" -> wait for the question
+    return say('Yes?', 'surprised');
+  }
+  if (Date.now() < awakeUntil) { awakeUntil = 0; return route(text); }
+  log('🙉 ignored: ' + text);                      // shows what it heard, to help you tune the name
 }
 
 async function route(t) {
   log('🧑 ' + t);
   const s = t.toLowerCase();
-  if (awaitName) {
-    awaitName = false;
-    const n = t.replace(/my name is|i am|i'm|this is|it's/ig, '').trim().split(' ')[0];
-    learn(n); return say('Nice to meet you, ' + n + '!', 'love');
-  }
   if (/stop (the )?(music|song)/.test(s)) { send('m:-1'); return say('Stopped.', 'neutral'); }
   if (/play.*(music|song)/.test(s)) { send('m:' + Math.floor(Math.random() * 3)); return; }
   if (/(turn|rotate|look) left/.test(s)) return send('r:-45');
@@ -127,10 +215,16 @@ async function ask(text) {
   mem.chat.push({role: 'user', content: (cur ? cur + ': ' : '') + text});
   mem.chat = mem.chat.slice(-12);
   send('x:7');
+  log('⏳ thinking... (the first answer can take a minute)');
   try {
-    const r = await fetch($('ol').value + '/api/chat', {method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({model: $('md').value, stream: false, messages: [{role: 'system', content: sys}, ...mem.chat]})});
-    let a = (await r.json()).message.content;
+    const r = await fetch($('ol').value + '/api/chat', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      signal: AbortSignal.timeout(120000),
+      body: JSON.stringify({model: $('md').value, stream: false, messages: [{role: 'system', content: sys}, ...mem.chat]})
+    });
+    const j = await r.json();
+    if (!r.ok || !j.message) throw new Error(j.error || ('HTTP ' + r.status));
+    let a = j.message.content;
     a = a.replace(/REMEMBER:(.*)/g, (_, f) => { mem.facts.push(f.trim()); return ''; }).trim();
     mem.facts = mem.facts.slice(-50);
     const m = a.match(/^\s*\[(\w+)\]/); const tag = m ? m[1].toLowerCase() : 'neutral';
@@ -138,20 +232,88 @@ async function ask(text) {
     mem.chat.push({role: 'assistant', content: a});
     save('mem', mem);
     say(a, tag);
-  } catch (e) { log('Ollama error: ' + e + ' (set OLLAMA_ORIGINS=*)'); send('x:2'); }
+  } catch (e) {
+    log('❌ Ollama error: ' + e.message + ' (check Ollama is running, the model is pulled, OLLAMA_ORIGINS=*)');
+    send('x:2');
+  }
 }
 
 $('snd').onclick = () => { const t = $('txt').value.trim(); if (t) { $('txt').value = ''; route(t); } };
 $('txt').onkeydown = e => { if (e.key == 'Enter') $('snd').click(); };
 
+// ---------- microphone ----------
+function makeRec(continuous, onFinal) {
+  const r = new SR();
+  r.lang = 'en-US'; r.continuous = continuous; r.interimResults = false;
+  r.onresult = e => {
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      if (e.results[i].isFinal) { const t = e.results[i][0].transcript.trim(); if (t) onFinal(t); }
+    }
+  };
+  r.onerror = e => {
+    if (e.error === 'no-speech' || e.error === 'aborted') return;
+    log('🎤 mic error: ' + e.error + (e.error === 'not-allowed' ? ' (allow the microphone in Chrome)' : ''));
+    if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+      listening = false; $('mic').textContent = '🎤 Listen: off';
+    }
+  };
+  return r;
+}
+
+function onVoice(t) {                // used by wake-name and always-listen modes
+  if (speaking) return;              // do not hear the robot's own voice
+  if (mode() === 'always') route(t); else heard(t);
+}
+
+function stopRec() { const r = rec; rec = null; if (r) { try { r.stop(); } catch (e) {} } }
+
+function startContinuous() {
+  stopRec();
+  const r = makeRec(true, onVoice);
+  r.onend = () => { setTimeout(() => { if (rec === r && listening) { try { r.start(); } catch (e) {} } }, 300); };
+  rec = r;
+  try { r.start(); } catch (e) { log('🎤 could not start: ' + e.message); }
+}
+
 $('mic').onclick = () => {
-  const R = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!R) return alert('Use Chrome');
-  listening = !listening; $('mic').textContent = '🎤 Listen: ' + (listening ? 'on' : 'off');
-  if (!listening) { rec && rec.stop(); return; }
-  rec = new R(); rec.continuous = true; rec.lang = 'en-US';
-  rec.onresult = e => { const x = e.results[e.results.length - 1]; if (x.isFinal && !speaking) route(x[0].transcript.trim()); };
-  rec.onend = () => listening && rec.start();
-  rec.start();
+  if (!SR) return alert('Use Chrome');
+  if (mode() === 'push') return log('Push-to-talk mode: hold the 🎙 button or the Space key.');
+  listening = !listening;
+  $('mic').textContent = '🎤 Listen: ' + (listening ? 'on' : 'off');
+  if (listening) { startContinuous(); log('🎤 listening — mode: ' + mode() + (mode() === 'wake' ? ' (say "' + WAKE()[0] + '" first)' : '')); }
+  else stopRec();
 };
+
+$('mode').onchange = () => {
+  localStorage.mode = $('mode').value;
+  if (listening) { listening = false; stopRec(); $('mic').textContent = '🎤 Listen: off'; }
+  log('Voice mode: ' + $('mode').value + (mode() === 'push' ? ' — hold the 🎙 button or the Space key' : ' — press 🎤 to start'));
+};
+
+// push-to-talk: the microphone is on only while you hold the button / Space
+function pttStart() {
+  if (mode() !== 'push' || pttRec) return;
+  if (!SR) return alert('Use Chrome');
+  if (speaking) speechSynthesis.cancel();
+  const r = makeRec(false, t => route(t));
+  r.onend = () => { pttRec = null; $('ptt').textContent = '🎙 Hold to talk (or Space)'; };
+  pttRec = r; $('ptt').textContent = '🎙 Listening...';
+  try { r.start(); } catch (e) { pttRec = null; }
+}
+function pttStop() { if (pttRec) { try { pttRec.stop(); } catch (e) {} } }
+
+$('ptt').onpointerdown = e => { e.preventDefault(); pttStart(); };
+['pointerup', 'pointerleave', 'pointercancel'].forEach(ev => $('ptt').addEventListener(ev, pttStop));
+addEventListener('keydown', e => {
+  if (e.code !== 'Space' || e.repeat || /INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) return;
+  e.preventDefault(); if (e.target.blur) e.target.blur(); pttStart();
+});
+addEventListener('keyup', e => {
+  if (e.code !== 'Space' || /INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) return;
+  e.preventDefault(); pttStop();
+});
+
+refreshList();
 </script>
+</body>
+</html>
